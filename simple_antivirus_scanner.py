@@ -158,6 +158,23 @@ def env_override_note(env_names: list[str]) -> str:
     return "; ".join(notes)
 
 
+def friendly_engine_output(output: str) -> str:
+    """Add practical guidance to common external engine errors."""
+
+    text = output.strip()
+    lowered = text.lower()
+    if "winerror 216" in lowered or "not compatible with the version of windows" in lowered:
+        return (
+            f"{text}\n\n"
+            "The executable was found, but Windows cannot run it on this architecture. "
+            "Install the ClamAV build that matches your Windows architecture, or set "
+            "CLAMAV_CLAMSCAN_PATH/CLAMAV_FRESHCLAM_PATH to compatible executables."
+        )
+    if "winerror 740" in lowered or "requires elevation" in lowered:
+        return f"{text}\n\nOpen PowerShell as Administrator and run the command again."
+    return text
+
+
 def program_files_candidates(*parts: str, executable: str) -> list[Path]:
     """Build Program Files candidate paths for Windows tools."""
 
@@ -304,20 +321,59 @@ def scan_with_local_signatures(
     return detections, len(files), skipped
 
 
+def clamav_paths() -> tuple[str, str]:
+    """Return ClamAV scanner and updater paths when installed."""
+
+    scanner = env_or_find(
+        "CLAMAV_CLAMSCAN_PATH",
+        [
+            "clamscan.exe",
+            "clamscan",
+            *program_files_candidates("ClamAV", executable="clamscan.exe"),
+            Path("C:/ProgramData/chocolatey/bin/clamscan.exe"),
+        ],
+    )
+    updater_candidates: list[str | Path] = [
+        "freshclam.exe",
+        "freshclam",
+        *program_files_candidates("ClamAV", executable="freshclam.exe"),
+        Path("C:/ProgramData/chocolatey/bin/freshclam.exe"),
+    ]
+    sibling_updater = sibling_executable(scanner, "freshclam.exe")
+    if sibling_updater:
+        updater_candidates.insert(0, sibling_updater)
+    updater = env_or_find("CLAMAV_FRESHCLAM_PATH", updater_candidates)
+    if updater and not scanner:
+        scanner = sibling_executable(updater, "clamscan.exe")
+    return scanner, updater
+
+
 def clamav_status() -> EngineStatus:
     """Check ClamAV availability."""
 
-    clamscan = shutil.which("clamscan")
+    clamscan, freshclam = clamav_paths()
     if not clamscan:
+        override_note = env_override_note(["CLAMAV_CLAMSCAN_PATH", "CLAMAV_FRESHCLAM_PATH"])
+        detail = "Install ClamAV and run freshclam to use its known malware signature database."
+        if override_note:
+            detail += f" Overrides: {override_note}."
         return EngineStatus(
             engine="clamav",
             available=False,
             version="not installed",
-            detail="Install ClamAV and run freshclam to use its known malware signature database.",
+            detail=detail,
         )
     code, output = run_command([clamscan, "--version"], timeout=30)
+    friendly_output = friendly_engine_output(output)
     version = output.strip().splitlines()[0] if output.strip() else "available"
-    return EngineStatus("clamav", code == 0, version, clamscan)
+    if code != 0 and ("winerror 216" in output.lower() or "not compatible with the version of windows" in output.lower()):
+        version = "incompatible executable"
+    detail = f"scanner={clamscan}"
+    if freshclam:
+        detail += f"; updater={freshclam}"
+    if code != 0 and friendly_output:
+        detail += f"; error={friendly_output}"
+    return EngineStatus("clamav", code == 0, version, detail)
 
 
 def defender_status() -> EngineStatus:
@@ -354,14 +410,18 @@ def avast_paths() -> tuple[str, str]:
     scanner_candidates = [
         "ashCmd.exe",
         *program_files_candidates("AVAST Software", "Avast", executable="ashCmd.exe"),
+        *program_files_candidates("AVAST Software", "Suite", executable="ashCmd.exe"),
         *program_files_candidates("Avast Software", "Avast", executable="ashCmd.exe"),
+        *program_files_candidates("Avast Software", "Suite", executable="ashCmd.exe"),
     ]
     scanner = env_or_find("AVAST_ASHCMD_PATH", scanner_candidates)
 
     updater_candidates: list[str | Path] = [
         "ashUpd.exe",
         *program_files_candidates("AVAST Software", "Avast", executable="ashUpd.exe"),
+        *program_files_candidates("AVAST Software", "Suite", executable="ashUpd.exe"),
         *program_files_candidates("Avast Software", "Avast", executable="ashUpd.exe"),
+        *program_files_candidates("Avast Software", "Suite", executable="ashUpd.exe"),
     ]
     sibling_updater = sibling_executable(scanner, "ashUpd.exe")
     if sibling_updater:
@@ -380,9 +440,12 @@ def avast_status() -> EngineStatus:
     if not scanner:
         override_note = env_override_note(["AVAST_ASHCMD_PATH", "AVAST_ASHUPD_PATH"])
         detail = (
-            "Avast ashCmd.exe was not found. Install Avast Business/Small Office "
-            "or set AVAST_ASHCMD_PATH to ashCmd.exe."
+            "Avast ashCmd.exe was not found, so Avast command-line scanning is unavailable. "
+            "Avast One may include ashUpd.exe for updates without including ashCmd.exe for scans. "
+            "Install an Avast edition that provides ashCmd.exe or set AVAST_ASHCMD_PATH."
         )
+        if updater:
+            detail += f" Updater found: {updater}."
         if override_note:
             detail += f" Overrides: {override_note}."
         return EngineStatus(
@@ -474,7 +537,7 @@ def render_engine_status(statuses: list[EngineStatus]) -> None:
 def scan_with_clamav(target: Path, timeout: int) -> tuple[list[Detection], int, list[str]]:
     """Run ClamAV clamscan and parse detections."""
 
-    clamscan = shutil.which("clamscan")
+    clamscan, _ = clamav_paths()
     if not clamscan:
         return [], 0, ["ClamAV clamscan was not found."]
 
@@ -511,7 +574,7 @@ def scan_with_clamav(target: Path, timeout: int) -> tuple[list[Detection], int, 
             notes.append(line)
 
     if code not in {0, 1} and output:
-        notes.append(output.strip()[:1000])
+        notes.append(friendly_engine_output(output)[:1500])
     return detections, 0, notes
 
 
@@ -704,7 +767,7 @@ def scan_with_avast(target: Path, timeout: int) -> tuple[list[Detection], int, l
             )
         )
     elif code not in {0, 1}:
-        notes.append((output or report_text or f"Avast exited with code {code}").strip()[:1000])
+        notes.append(friendly_engine_output(output or report_text or f"Avast exited with code {code}")[:1500])
     return detections, 0, notes
 
 
@@ -730,7 +793,7 @@ def scan_with_kaspersky(target: Path, timeout: int) -> tuple[list[Detection], in
     detections = parse_vendor_detections(engine_name, target, output, report_text)
     notes: list[str] = []
     if code not in {0, 1} and output:
-        notes.append(output.strip()[:1000])
+        notes.append(friendly_engine_output(output)[:1500])
     return detections, 0, notes
 
 
@@ -830,11 +893,21 @@ def render_detections(detections: list[Detection]) -> None:
     console.print(table)
 
 
-def explain_results(detections: list[Detection], engines: list[str], files_scanned: int) -> str:
+def explain_results(
+    detections: list[Detection],
+    engines: list[str],
+    files_scanned: int,
+    notes: list[str] | None = None,
+) -> str:
     """Explain scan results in plain language."""
 
     engine_text = ", ".join(engines)
     if not detections:
+        if notes:
+            return (
+                f"No detections were reported by {engine_text}, but at least one engine produced a warning "
+                "or error. Check the Scan Notes section before treating this as a clean result."
+            )
         if files_scanned <= 0:
             return (
                 f"The scan completed with {engine_text}, and no detections were reported. "
@@ -983,12 +1056,18 @@ def run_update(args: argparse.Namespace) -> int:
     engines = resolve_engines(args.engine)
     for engine in engines:
         if engine == "clamav":
-            freshclam = shutil.which("freshclam")
+            _, freshclam = clamav_paths()
             if not freshclam:
-                console.print("[yellow]freshclam was not found. Install ClamAV to update ClamAV signatures.[/yellow]")
+                override_note = env_override_note(["CLAMAV_CLAMSCAN_PATH", "CLAMAV_FRESHCLAM_PATH"])
+                message = "freshclam was not found. Install ClamAV or set CLAMAV_FRESHCLAM_PATH."
+                if override_note:
+                    message += f" Overrides: {override_note}."
+                console.print(f"[yellow]{message}[/yellow]")
                 continue
             code, output = run_command([freshclam], timeout=args.timeout)
-            console.print(Panel(output.strip() or f"freshclam exited with code {code}", title="ClamAV Update"))
+            console.print(
+                Panel(friendly_engine_output(output) or f"freshclam exited with code {code}", title="ClamAV Update")
+            )
         elif engine == "defender":
             if platform.system().lower() != "windows":
                 console.print("[yellow]Windows Defender updates are only available on Windows.[/yellow]")
@@ -997,7 +1076,12 @@ def run_update(args: argparse.Namespace) -> int:
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Update-MpSignature"],
                 timeout=args.timeout,
             )
-            console.print(Panel(output.strip() or f"Update-MpSignature exited with code {code}", title="Defender Update"))
+            console.print(
+                Panel(
+                    friendly_engine_output(output) or f"Update-MpSignature exited with code {code}",
+                    title="Defender Update",
+                )
+            )
         elif engine == "avast":
             scanner, updater = avast_paths()
             if not updater:
@@ -1011,16 +1095,26 @@ def run_update(args: argparse.Namespace) -> int:
                 console.print(f"[yellow]{message}[/yellow]")
                 continue
             code, output = run_command([updater, "vps"], timeout=args.timeout)
-            console.print(Panel(output.strip() or f"ashUpd.exe exited with code {code}", title="Avast VPS Update"))
+            console.print(
+                Panel(friendly_engine_output(output) or f"ashUpd.exe exited with code {code}", title="Avast VPS Update")
+            )
         elif engine == "kaspersky":
             avp, kescli = kaspersky_paths()
             if avp:
                 code, output = run_command([avp, "UPDATE"], timeout=args.timeout)
-                console.print(Panel(output.strip() or f"avp.com UPDATE exited with code {code}", title="Kaspersky Update"))
+                console.print(
+                    Panel(
+                        friendly_engine_output(output) or f"avp.com UPDATE exited with code {code}",
+                        title="Kaspersky Update",
+                    )
+                )
             elif kescli:
                 code, output = run_command([kescli, "--opswat", "UpdateDefinitions"], timeout=args.timeout)
                 console.print(
-                    Panel(output.strip() or f"kescli UpdateDefinitions exited with code {code}", title="Kaspersky Update")
+                    Panel(
+                        friendly_engine_output(output) or f"kescli UpdateDefinitions exited with code {code}",
+                        title="Kaspersky Update",
+                    )
                 )
             else:
                 console.print("[yellow]Kaspersky avp.com/kescli.exe was not found.[/yellow]")
@@ -1075,7 +1169,7 @@ def run_scan(args: argparse.Namespace) -> int:
 
     detections = dedupe_detections(all_detections)
     render_detections(detections)
-    explanation = explain_results(detections, engines, files_scanned)
+    explanation = explain_results(detections, engines, files_scanned, notes)
     console.print(Panel(explanation, title="Result Explanation", border_style="blue"))
 
     if notes:

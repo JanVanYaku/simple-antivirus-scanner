@@ -42,6 +42,8 @@ python .\simple_antivirus_scanner.py status
 If Avast or Kaspersky is installed in a non-standard location, set one of these environment variables before scanning:
 
 ```powershell
+$env:CLAMAV_CLAMSCAN_PATH="C:\Program Files\ClamAV\clamscan.exe"
+$env:CLAMAV_FRESHCLAM_PATH="C:\Program Files\ClamAV\freshclam.exe"
 $env:AVAST_ASHCMD_PATH="C:\Program Files\AVAST Software\Avast\ashCmd.exe"
 $env:AVAST_ASHUPD_PATH="C:\Program Files\AVAST Software\Avast\ashUpd.exe"
 $env:KASPERSKY_AVP_PATH="C:\Program Files\Kaspersky Lab\Your Product\avp.com"
@@ -56,6 +58,16 @@ Test-Path "C:\Program Files\AVAST Software\Avast\ashUpd.exe"
 ```
 
 `AVAST_ASHCMD_PATH` is used for scans. `AVAST_ASHUPD_PATH` is used for updates. If `ashCmd.exe` is found, the app also checks the same folder for `ashUpd.exe` automatically.
+
+Avast One may install into:
+
+```powershell
+C:\Program Files\Avast Software\Suite
+```
+
+That folder may include `ashUpd.exe` for updates but not `ashCmd.exe` for command-line scans. In that case Avast updates can work, but Avast scanning through this wrapper is unavailable unless your Avast edition provides `ashCmd.exe`.
+
+If ClamAV is found but Windows reports `WinError 216`, the installed ClamAV executable does not match your Windows architecture. Install the matching ClamAV build for your machine, or set `CLAMAV_CLAMSCAN_PATH` and `CLAMAV_FRESHCLAM_PATH` to compatible executables.
 
 ## Update Signatures
 
@@ -82,6 +94,8 @@ Update Avast virus definitions if Avast is installed:
 ```powershell
 python .\simple_antivirus_scanner.py update --engine avast
 ```
+
+If Avast returns `WinError 740`, open PowerShell as Administrator and run the update command again.
 
 Update Kaspersky databases if Kaspersky is installed:
 
