@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import hashlib
 import json
 import os
 import platform
 import shutil
 import subprocess
+import tempfile
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -38,6 +40,7 @@ EICAR_BYTES = (
 )
 DEFAULT_QUARANTINE_DIR = Path.home() / ".simple_antivirus_quarantine"
 DEFAULT_MAX_SIZE_MB = 256
+SUPPORTED_ENGINES = {"local", "clamav", "defender", "avast", "kaspersky"}
 
 
 @dataclass
@@ -103,6 +106,45 @@ def run_command(command: list[str], timeout: int = 300) -> tuple[int, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, str(exc)
     return completed.returncode, completed.stdout + completed.stderr
+
+
+def find_existing_executable(candidates: list[str | Path]) -> str:
+    """Return the first executable found in PATH or common install locations."""
+
+    for candidate in candidates:
+        text = str(candidate)
+        found = shutil.which(text)
+        if found:
+            return found
+        matches = glob.glob(text) if any(char in text for char in "*?") else []
+        for match in matches:
+            path_match = Path(match)
+            if path_match.is_file():
+                return str(path_match)
+        path = Path(text)
+        if path.is_file():
+            return str(path)
+    return ""
+
+
+def env_or_find(env_name: str, candidates: list[str | Path]) -> str:
+    """Use an environment variable path first, otherwise search candidates."""
+
+    override = os.environ.get(env_name, "").strip()
+    if override and Path(override).is_file():
+        return override
+    return find_existing_executable(candidates)
+
+
+def program_files_candidates(*parts: str, executable: str) -> list[Path]:
+    """Build Program Files candidate paths for Windows tools."""
+
+    candidates: list[Path] = []
+    for env_name in ["ProgramFiles", "ProgramFiles(x86)"]:
+        root = os.environ.get(env_name)
+        if root:
+            candidates.append(Path(root).joinpath(*parts, executable))
+    return candidates
 
 
 def sha256_file(path: Path) -> str:
@@ -284,6 +326,104 @@ def defender_status() -> EngineStatus:
     return EngineStatus("defender", True, "Microsoft Defender", output.strip())
 
 
+def avast_paths() -> tuple[str, str]:
+    """Return Avast scanner and updater paths when installed."""
+
+    scanner = env_or_find(
+        "AVAST_ASHCMD_PATH",
+        [
+            "ashCmd.exe",
+            *program_files_candidates("AVAST Software", "Avast", executable="ashCmd.exe"),
+            *program_files_candidates("Avast Software", "Avast", executable="ashCmd.exe"),
+        ],
+    )
+    updater = env_or_find(
+        "AVAST_ASHUPD_PATH",
+        [
+            "ashUpd.exe",
+            *program_files_candidates("AVAST Software", "Avast", executable="ashUpd.exe"),
+            *program_files_candidates("Avast Software", "Avast", executable="ashUpd.exe"),
+        ],
+    )
+    return scanner, updater
+
+
+def avast_status() -> EngineStatus:
+    """Check Avast command-line scanner availability."""
+
+    scanner, updater = avast_paths()
+    if not scanner:
+        return EngineStatus(
+            engine="avast",
+            available=False,
+            version="not installed",
+            detail=(
+                "Avast ashCmd.exe was not found. Install Avast Business/Small Office "
+                "or set AVAST_ASHCMD_PATH to ashCmd.exe."
+            ),
+        )
+    detail = f"scanner={scanner}"
+    if updater:
+        detail += f"; updater={updater}"
+    code, output = run_command([scanner, "/?"], timeout=30)
+    first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    version = first_line[:120] if first_line else "Avast command-line scanner"
+    return EngineStatus("avast", code in {0, 1}, version, detail)
+
+
+def kaspersky_paths() -> tuple[str, str]:
+    """Return Kaspersky avp.com and kescli.exe paths when installed."""
+
+    avp = env_or_find(
+        "KASPERSKY_AVP_PATH",
+        [
+            "avp.com",
+            *program_files_candidates("Kaspersky Lab", "*", executable="avp.com"),
+            *program_files_candidates("Kaspersky", "*", executable="avp.com"),
+        ],
+    )
+    kescli = env_or_find(
+        "KASPERSKY_KESCLI_PATH",
+        [
+            "kescli.exe",
+            "kescli",
+            *program_files_candidates("Kaspersky Lab", "*", executable="kescli.exe"),
+            *program_files_candidates("Kaspersky", "*", executable="kescli.exe"),
+        ],
+    )
+    return avp, kescli
+
+
+def kaspersky_status() -> EngineStatus:
+    """Check Kaspersky command-line scanner availability."""
+
+    avp, kescli = kaspersky_paths()
+    if not avp and not kescli:
+        return EngineStatus(
+            engine="kaspersky",
+            available=False,
+            version="not installed",
+            detail=(
+                "Kaspersky avp.com/kescli.exe was not found. Install Kaspersky "
+                "or set KASPERSKY_AVP_PATH/KASPERSKY_KESCLI_PATH."
+            ),
+        )
+
+    if avp:
+        code, output = run_command([avp, "VERSION"], timeout=30)
+        first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+        version = first_line[:120] if first_line else "Kaspersky avp.com"
+        detail = f"avp={avp}"
+        if kescli:
+            detail += f"; kescli={kescli}"
+        return EngineStatus("kaspersky", code == 0, version, detail)
+
+    code, output = run_command([kescli, "--opswat", "GetDefinitionState"], timeout=30)
+    first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    version = first_line[:120] if first_line else "Kaspersky kescli"
+    return EngineStatus("kaspersky", code == 0, version, f"kescli={kescli}")
+
+
 def render_engine_status(statuses: list[EngineStatus]) -> None:
     """Print engine status table."""
 
@@ -398,6 +538,173 @@ $detections | ConvertTo-Json -Depth 5 -Compress
     return detections, 0, []
 
 
+def parse_vendor_detections(
+    engine: str,
+    target: Path,
+    output: str,
+    report_text: str = "",
+) -> list[Detection]:
+    """Parse common vendor scanner output into Detection objects."""
+
+    combined = "\n".join(part for part in [output, report_text] if part)
+    detections: list[Detection] = []
+    seen: set[tuple[str, str]] = set()
+    keywords = ["eicar", "infected", "infection", "malware", "trojan", "worm", "virus", "threat", "found"]
+    clean_phrases = ["no threat", "no threats", "no virus", "no viruses", "0 infected", "nothing found"]
+
+    for raw_line in combined.splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if not line:
+            continue
+        if any(phrase in lowered for phrase in clean_phrases):
+            continue
+        if not any(keyword in lowered for keyword in keywords):
+            continue
+
+        file_path = extract_detection_path(line, target)
+        threat_name = extract_threat_name(line, engine)
+        key = (str(file_path).lower(), threat_name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        digest = ""
+        try:
+            if file_path.exists() and file_path.is_file():
+                digest = sha256_file(file_path)
+        except OSError:
+            pass
+        detections.append(
+            Detection(
+                path=str(file_path.resolve()) if file_path.exists() else str(file_path),
+                engine=engine,
+                threat_name=threat_name,
+                malware_type=classify_threat(threat_name),
+                severity="HIGH",
+                evidence=line[:500],
+                sha256=digest,
+            )
+        )
+    return detections
+
+
+def extract_detection_path(line: str, target: Path) -> Path:
+    """Extract a likely file path from scanner output."""
+
+    quoted = re_find_quoted_path(line)
+    if quoted:
+        return Path(quoted)
+
+    for marker in [" : ", ": ", "\t"]:
+        if marker in line:
+            candidate = line.rsplit(marker, 1)[0].strip()
+            if len(candidate) > 2:
+                path = Path(candidate.strip('"'))
+                if path.exists() or "\\" in candidate or "/" in candidate:
+                    return path
+    return target
+
+
+def re_find_quoted_path(line: str) -> str:
+    """Find a quoted Windows or POSIX path in a line of scanner output."""
+
+    import re
+
+    match = re.search(r'"([A-Za-z]:\\[^"]+|/[^"]+)"', line)
+    return match.group(1) if match else ""
+
+
+def extract_threat_name(line: str, engine: str) -> str:
+    """Extract a likely threat name from scanner output."""
+
+    import re
+
+    patterns = [
+        r"FOUND\s*:?\s*(.+)$",
+        r"Threat(?:Name)?\s*[:=]\s*(.+)$",
+        r"Virus\s*[:=]\s*(.+)$",
+        r"Infected\s*[:=]\s*(.+)$",
+        r"Malware\s*[:=]\s*(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, line, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip().strip('"')[:120]
+    if ":" in line:
+        tail = line.rsplit(":", 1)[-1].strip()
+        if tail:
+            return tail[:120]
+    return f"{engine.title()} Detection"
+
+
+def scan_with_avast(target: Path, timeout: int) -> tuple[list[Detection], int, list[str]]:
+    """Run Avast ashCmd.exe and parse possible detections."""
+
+    scanner, _ = avast_paths()
+    if not scanner:
+        return [], 0, ["Avast ashCmd.exe was not found."]
+
+    report_path = Path(tempfile.gettempdir()) / f"simple_avast_scan_{int(time.time())}.txt"
+    command = [
+        scanner,
+        str(target),
+        "/_",
+        "/a",
+        "/c",
+        "/d",
+        "/s",
+        "/p=4",
+        f"/r={report_path}",
+    ]
+    code, output = run_command(command, timeout=timeout)
+    report_text = ""
+    if report_path.exists():
+        report_text = report_path.read_text(encoding="utf-8", errors="replace")
+    detections = parse_vendor_detections("avast", target, output, report_text)
+    notes: list[str] = []
+    if code == 1 and not detections:
+        detections.append(
+            Detection(
+                path=str(target.resolve()),
+                engine="avast",
+                threat_name="Avast Threat Detected",
+                malware_type="malware",
+                severity="HIGH",
+                evidence="Avast returned exit code 1, which indicates a detected threat.",
+                sha256="",
+            )
+        )
+    elif code not in {0, 1}:
+        notes.append((output or report_text or f"Avast exited with code {code}").strip()[:1000])
+    return detections, 0, notes
+
+
+def scan_with_kaspersky(target: Path, timeout: int) -> tuple[list[Detection], int, list[str]]:
+    """Run Kaspersky avp.com or kescli.exe and parse possible detections."""
+
+    avp, kescli = kaspersky_paths()
+    if not avp and not kescli:
+        return [], 0, ["Kaspersky avp.com/kescli.exe was not found."]
+
+    report_path = Path(tempfile.gettempdir()) / f"simple_kaspersky_scan_{int(time.time())}.txt"
+    if avp:
+        command = [avp, "SCAN", str(target), "/i0", f"/R:{report_path}"]
+        engine_name = "kaspersky"
+    else:
+        command = [kescli, "--opswat", "Scan", str(target), "0"]
+        engine_name = "kaspersky"
+
+    code, output = run_command(command, timeout=timeout)
+    report_text = ""
+    if report_path.exists():
+        report_text = report_path.read_text(encoding="utf-8", errors="replace")
+    detections = parse_vendor_detections(engine_name, target, output, report_text)
+    notes: list[str] = []
+    if code not in {0, 1} and output:
+        notes.append(output.strip()[:1000])
+    return detections, 0, notes
+
+
 def defender_severity(value: object) -> str:
     """Convert Defender severity ID to a readable severity."""
 
@@ -434,14 +741,17 @@ def resolve_engines(requested: str) -> list[str]:
         engines = ["local"]
         if clamav_status().available:
             engines.append("clamav")
-        elif defender_status().available:
+        if avast_status().available:
+            engines.append("avast")
+        if kaspersky_status().available:
+            engines.append("kaspersky")
+        if defender_status().available:
             engines.append("defender")
         return engines
     if value == "all":
-        return ["local", "clamav", "defender"]
+        return ["local", "clamav", "avast", "kaspersky", "defender"]
     engines = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {"local", "clamav", "defender"}
-    invalid = [engine for engine in engines if engine not in valid]
+    invalid = [engine for engine in engines if engine not in SUPPORTED_ENGINES]
     if invalid:
         raise argparse.ArgumentTypeError(f"Unsupported engine(s): {', '.join(invalid)}")
     return engines
@@ -496,6 +806,12 @@ def explain_results(detections: list[Detection], engines: list[str], files_scann
 
     engine_text = ", ".join(engines)
     if not detections:
+        if files_scanned <= 0:
+            return (
+                f"The scan completed with {engine_text}, and no detections were reported. "
+                "Some external engines do not return a file count to this wrapper. If an engine was not installed "
+                "or could not run, check the Scan Notes section."
+            )
         return (
             f"Scanned {files_scanned} file(s) with {engine_text}. No detections were found. "
             "This is good, but it does not prove the machine is completely clean. Keep signatures updated, "
@@ -620,7 +936,15 @@ def run_status(args: argparse.Namespace) -> int:
     """Show engine status."""
 
     del args
-    render_engine_status([clamav_status(), defender_status(), EngineStatus("local", True, "built-in", "EICAR test and optional SHA-256 signature DB.")])
+    render_engine_status(
+        [
+            clamav_status(),
+            avast_status(),
+            kaspersky_status(),
+            defender_status(),
+            EngineStatus("local", True, "built-in", "EICAR test and optional SHA-256 signature DB."),
+        ]
+    )
     return 0
 
 
@@ -645,6 +969,25 @@ def run_update(args: argparse.Namespace) -> int:
                 timeout=args.timeout,
             )
             console.print(Panel(output.strip() or f"Update-MpSignature exited with code {code}", title="Defender Update"))
+        elif engine == "avast":
+            _, updater = avast_paths()
+            if not updater:
+                console.print("[yellow]Avast ashUpd.exe was not found. Install Avast or set AVAST_ASHUPD_PATH.[/yellow]")
+                continue
+            code, output = run_command([updater, "vps"], timeout=args.timeout)
+            console.print(Panel(output.strip() or f"ashUpd.exe exited with code {code}", title="Avast VPS Update"))
+        elif engine == "kaspersky":
+            avp, kescli = kaspersky_paths()
+            if avp:
+                code, output = run_command([avp, "UPDATE"], timeout=args.timeout)
+                console.print(Panel(output.strip() or f"avp.com UPDATE exited with code {code}", title="Kaspersky Update"))
+            elif kescli:
+                code, output = run_command([kescli, "--opswat", "UpdateDefinitions"], timeout=args.timeout)
+                console.print(
+                    Panel(output.strip() or f"kescli UpdateDefinitions exited with code {code}", title="Kaspersky Update")
+                )
+            else:
+                console.print("[yellow]Kaspersky avp.com/kescli.exe was not found.[/yellow]")
         elif engine == "local":
             console.print("[blue]Local signatures do not need updates unless you provide a new --signature-db file.[/blue]")
     return 0
@@ -682,6 +1025,12 @@ def run_scan(args: argparse.Namespace) -> int:
             files_scanned = max(files_scanned, count)
         elif engine == "defender":
             detections, count, engine_notes = scan_with_defender(target, timeout=args.timeout)
+            files_scanned = max(files_scanned, count)
+        elif engine == "avast":
+            detections, count, engine_notes = scan_with_avast(target, timeout=args.timeout)
+            files_scanned = max(files_scanned, count)
+        elif engine == "kaspersky":
+            detections, count, engine_notes = scan_with_kaspersky(target, timeout=args.timeout)
             files_scanned = max(files_scanned, count)
         else:
             detections, count, engine_notes = [], 0, [f"Unknown engine: {engine}"]
@@ -770,13 +1119,21 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=run_status)
 
     update = subparsers.add_parser("update", help="Update ClamAV or Windows Defender signatures.")
-    update.add_argument("--engine", default="auto", help="auto, clamav, defender, local, all, or comma-separated.")
+    update.add_argument(
+        "--engine",
+        default="auto",
+        help="auto, local, clamav, avast, kaspersky, defender, all, or comma-separated.",
+    )
     update.add_argument("--timeout", type=int, default=900, help="Update timeout in seconds.")
     update.set_defaults(func=run_update)
 
     scan = subparsers.add_parser("scan", help="Scan a file or folder.")
     scan.add_argument("target", type=Path, help="File or folder to scan.")
-    scan.add_argument("--engine", default="auto", help="auto, local, clamav, defender, all, or comma-separated.")
+    scan.add_argument(
+        "--engine",
+        default="auto",
+        help="auto, local, clamav, avast, kaspersky, defender, all, or comma-separated.",
+    )
     scan.add_argument("--signature-db", type=Path, help="Optional custom SHA-256 signature JSON file.")
     scan.add_argument("--max-size-mb", type=int, default=DEFAULT_MAX_SIZE_MB, help="Max file size for local scanning.")
     scan.add_argument("--timeout", type=int, default=1800, help="External engine timeout in seconds.")
