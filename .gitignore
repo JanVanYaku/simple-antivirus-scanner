@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+reports/
+demo_lab/
+quarantine*/
+*.json
+*.csv
+.env

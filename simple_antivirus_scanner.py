@@ -1,0 +1,817 @@
+#######################################################################
+# Author: Lehlohonolo Adolf Matobakele
+# Email: lehlohonolo.matobakele@gov.ls
+# Contacxt: 00266 62320704
+#######################################################################
+
+"""Simple antivirus-style scanner using local signature engines."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import time
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
+
+
+console = Console()
+
+
+EICAR_BYTES = (
+    b"X5O!P%@AP[4\\PZX54(P^)7CC)7}"
+    b"$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+)
+DEFAULT_QUARANTINE_DIR = Path.home() / ".simple_antivirus_quarantine"
+DEFAULT_MAX_SIZE_MB = 256
+
+
+@dataclass
+class EngineStatus:
+    """Availability information for one scan engine."""
+
+    engine: str
+    available: bool
+    version: str
+    detail: str
+
+
+@dataclass
+class Signature:
+    """One custom hash signature."""
+
+    sha256: str
+    name: str
+    malware_type: str
+    severity: str
+
+
+@dataclass
+class Detection:
+    """One antivirus finding."""
+
+    path: str
+    engine: str
+    threat_name: str
+    malware_type: str
+    severity: str
+    evidence: str
+    sha256: str
+    action: str = "pending"
+    action_detail: str = ""
+
+
+@dataclass
+class ScanReport:
+    """Serializable scan report."""
+
+    generated_at: str
+    target: str
+    engines: list[str]
+    files_scanned: int
+    detections: list[Detection]
+    explanation: str
+
+
+def run_command(command: list[str], timeout: int = 300) -> tuple[int, str]:
+    """Run a command and return exit code plus combined output."""
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
+    return completed.returncode, completed.stdout + completed.stderr
+
+
+def sha256_file(path: Path) -> str:
+    """Calculate a file SHA-256 hash."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_contains_bytes(path: Path, needle: bytes) -> bool:
+    """Search for a byte signature without loading huge files into memory."""
+
+    overlap = max(len(needle) - 1, 0)
+    previous = b""
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            haystack = previous + chunk
+            if needle in haystack:
+                return True
+            previous = haystack[-overlap:] if overlap else b""
+    return False
+
+
+def iter_files(target: Path, max_size_mb: int) -> tuple[list[Path], list[str]]:
+    """Collect readable files under a target path."""
+
+    max_size = max_size_mb * 1024 * 1024
+    skipped: list[str] = []
+    files: list[Path] = []
+
+    if target.is_file():
+        candidates: Iterable[Path] = [target]
+    elif target.is_dir():
+        candidates = (path for path in target.rglob("*") if path.is_file())
+    else:
+        return [], [f"Target does not exist: {target}"]
+
+    for path in candidates:
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            skipped.append(f"{path}: {exc}")
+            continue
+        if size > max_size:
+            skipped.append(f"{path}: skipped because it is larger than {max_size_mb} MB")
+            continue
+        files.append(path)
+    return files, skipped
+
+
+def load_signature_db(path: Path | None) -> list[Signature]:
+    """Load optional custom SHA-256 signatures."""
+
+    signatures = [
+        Signature(
+            sha256=hashlib.sha256(EICAR_BYTES).hexdigest(),
+            name="EICAR-Test-File",
+            malware_type="test-file",
+            severity="TEST",
+        )
+    ]
+    if not path:
+        return signatures
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    records = data.get("signatures", data) if isinstance(data, dict) else data
+    for record in records:
+        signatures.append(
+            Signature(
+                sha256=str(record["sha256"]).lower(),
+                name=str(record.get("name", "Custom.Signature")),
+                malware_type=str(record.get("type", record.get("malware_type", "unknown"))),
+                severity=str(record.get("severity", "HIGH")).upper(),
+            )
+        )
+    return signatures
+
+
+def scan_with_local_signatures(
+    target: Path,
+    signature_db: Path | None,
+    max_size_mb: int,
+) -> tuple[list[Detection], int, list[str]]:
+    """Scan files with local hash signatures and the harmless EICAR test pattern."""
+
+    signatures = {signature.sha256.lower(): signature for signature in load_signature_db(signature_db)}
+    files, skipped = iter_files(target, max_size_mb=max_size_mb)
+    detections: list[Detection] = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Local signature scan", total=len(files))
+        for path in files:
+            try:
+                digest = sha256_file(path)
+                if digest in signatures:
+                    signature = signatures[digest]
+                    detections.append(
+                        Detection(
+                            path=str(path.resolve()),
+                            engine="local-signatures",
+                            threat_name=signature.name,
+                            malware_type=signature.malware_type,
+                            severity=signature.severity,
+                            evidence=f"SHA-256 matched {signature.name}",
+                            sha256=digest,
+                        )
+                    )
+                elif file_contains_bytes(path, EICAR_BYTES):
+                    detections.append(
+                        Detection(
+                            path=str(path.resolve()),
+                            engine="local-signatures",
+                            threat_name="EICAR-Test-File",
+                            malware_type="test-file",
+                            severity="TEST",
+                            evidence="File contains the harmless EICAR antivirus test string.",
+                            sha256=digest,
+                        )
+                    )
+            except OSError as exc:
+                skipped.append(f"{path}: {exc}")
+            finally:
+                progress.advance(task)
+
+    return detections, len(files), skipped
+
+
+def clamav_status() -> EngineStatus:
+    """Check ClamAV availability."""
+
+    clamscan = shutil.which("clamscan")
+    if not clamscan:
+        return EngineStatus(
+            engine="clamav",
+            available=False,
+            version="not installed",
+            detail="Install ClamAV and run freshclam to use its known malware signature database.",
+        )
+    code, output = run_command([clamscan, "--version"], timeout=30)
+    version = output.strip().splitlines()[0] if output.strip() else "available"
+    return EngineStatus("clamav", code == 0, version, clamscan)
+
+
+def defender_status() -> EngineStatus:
+    """Check Windows Defender availability."""
+
+    if platform.system().lower() != "windows":
+        return EngineStatus("defender", False, "not windows", "Windows Defender is only available on Windows.")
+
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        (
+            "$status = Get-MpComputerStatus; "
+            "[pscustomobject]@{"
+            "AntivirusEnabled=$status.AntivirusEnabled;"
+            "RealTimeProtectionEnabled=$status.RealTimeProtectionEnabled;"
+            "SignatureAge=$status.AntivirusSignatureAge;"
+            "SignatureVersion=$status.AntivirusSignatureVersion"
+            "} | ConvertTo-Json -Compress"
+        ),
+    ]
+    code, output = run_command(command, timeout=60)
+    if code != 0:
+        return EngineStatus("defender", False, "unavailable", output.strip()[:300])
+    return EngineStatus("defender", True, "Microsoft Defender", output.strip())
+
+
+def render_engine_status(statuses: list[EngineStatus]) -> None:
+    """Print engine status table."""
+
+    table = Table(title="Antivirus Engine Status", show_lines=True)
+    table.add_column("Engine")
+    table.add_column("Available")
+    table.add_column("Version")
+    table.add_column("Detail", overflow="fold")
+    for status in statuses:
+        table.add_row(
+            status.engine,
+            "yes" if status.available else "no",
+            status.version,
+            status.detail or "-",
+        )
+    console.print(table)
+
+
+def scan_with_clamav(target: Path, timeout: int) -> tuple[list[Detection], int, list[str]]:
+    """Run ClamAV clamscan and parse detections."""
+
+    clamscan = shutil.which("clamscan")
+    if not clamscan:
+        return [], 0, ["ClamAV clamscan was not found."]
+
+    command = [clamscan, "--recursive=yes", "--infected", "--no-summary", str(target)]
+    code, output = run_command(command, timeout=timeout)
+    detections: list[Detection] = []
+    notes: list[str] = []
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.endswith("FOUND") and ": " in line:
+            file_text, threat_text = line.rsplit(": ", 1)
+            threat_name = threat_text.removesuffix(" FOUND").strip()
+            file_path = Path(file_text)
+            digest = ""
+            try:
+                digest = sha256_file(file_path)
+            except OSError:
+                pass
+            detections.append(
+                Detection(
+                    path=str(file_path.resolve()),
+                    engine="clamav",
+                    threat_name=threat_name,
+                    malware_type=classify_threat(threat_name),
+                    severity="HIGH",
+                    evidence=f"ClamAV signature matched {threat_name}",
+                    sha256=digest,
+                )
+            )
+        elif "ERROR" in line.upper():
+            notes.append(line)
+
+    if code not in {0, 1} and output:
+        notes.append(output.strip()[:1000])
+    return detections, 0, notes
+
+
+def scan_with_defender(target: Path, timeout: int) -> tuple[list[Detection], int, list[str]]:
+    """Run a Windows Defender custom scan and query matching detections."""
+
+    status = defender_status()
+    if not status.available:
+        return [], 0, [status.detail]
+
+    target_text = str(target.resolve())
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$scanPath = {json.dumps(target_text)}
+Start-MpScan -ScanType CustomScan -ScanPath $scanPath
+$detections = Get-MpThreatDetection | Where-Object {{
+    ($_.Resources -join '|') -like "*$scanPath*"
+}} | Select-Object ThreatName, ThreatID, SeverityID, Resources, InitialDetectionTime, ActionSuccess
+$detections | ConvertTo-Json -Depth 5 -Compress
+"""
+    command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+    code, output = run_command(command, timeout=timeout)
+    if code != 0:
+        return [], 0, [output.strip()[:1000]]
+    if not output.strip():
+        return [], 0, []
+
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        return [], 0, [output.strip()[:1000]]
+
+    records = data if isinstance(data, list) else [data]
+    detections: list[Detection] = []
+    for record in records:
+        resources = record.get("Resources") or []
+        if isinstance(resources, str):
+            resources = [resources]
+        resource_path = next((item for item in resources if str(item)), target_text)
+        detections.append(
+            Detection(
+                path=str(Path(resource_path).resolve()),
+                engine="defender",
+                threat_name=str(record.get("ThreatName", "Microsoft Defender Detection")),
+                malware_type=classify_threat(str(record.get("ThreatName", ""))),
+                severity=defender_severity(record.get("SeverityID")),
+                evidence=f"Microsoft Defender threat id {record.get('ThreatID', 'unknown')}",
+                sha256="",
+                action="handled-by-defender" if record.get("ActionSuccess") else "pending",
+                action_detail="Microsoft Defender may have already quarantined or remediated this item.",
+            )
+        )
+    return detections, 0, []
+
+
+def defender_severity(value: object) -> str:
+    """Convert Defender severity ID to a readable severity."""
+
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if number >= 5:
+        return "HIGH"
+    if number >= 3:
+        return "MEDIUM"
+    return "LOW"
+
+
+def classify_threat(name: str) -> str:
+    """Make a simple malware type guess from a signature name."""
+
+    lowered = name.lower()
+    for keyword in ["worm", "trojan", "ransom", "spyware", "adware", "rootkit", "backdoor"]:
+        if keyword in lowered:
+            return keyword
+    if "eicar" in lowered:
+        return "test-file"
+    if "virus" in lowered:
+        return "virus"
+    return "malware"
+
+
+def resolve_engines(requested: str) -> list[str]:
+    """Resolve engine selection to a list of engines."""
+
+    value = requested.lower()
+    if value == "auto":
+        engines = ["local"]
+        if clamav_status().available:
+            engines.append("clamav")
+        elif defender_status().available:
+            engines.append("defender")
+        return engines
+    if value == "all":
+        return ["local", "clamav", "defender"]
+    engines = [item.strip() for item in value.split(",") if item.strip()]
+    valid = {"local", "clamav", "defender"}
+    invalid = [engine for engine in engines if engine not in valid]
+    if invalid:
+        raise argparse.ArgumentTypeError(f"Unsupported engine(s): {', '.join(invalid)}")
+    return engines
+
+
+def dedupe_detections(detections: list[Detection]) -> list[Detection]:
+    """Remove duplicate engine/path/threat detections."""
+
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[Detection] = []
+    for detection in detections:
+        key = (detection.path.lower(), detection.engine, detection.threat_name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(detection)
+    return unique
+
+
+def render_detections(detections: list[Detection]) -> None:
+    """Print detection table."""
+
+    table = Table(title="Antivirus Scan Results", show_lines=True)
+    table.add_column("#", justify="right", style="cyan")
+    table.add_column("Engine", overflow="fold")
+    table.add_column("Severity")
+    table.add_column("Threat", overflow="fold")
+    table.add_column("Type")
+    table.add_column("File", overflow="fold")
+    table.add_column("Evidence", overflow="fold")
+
+    if not detections:
+        table.add_row("-", "-", "CLEAN", "-", "-", "No detections found.", "-")
+    for index, detection in enumerate(detections, start=1):
+        color = "red" if detection.severity in {"HIGH", "CRITICAL"} else "yellow"
+        if detection.severity in {"LOW", "TEST"}:
+            color = "green"
+        table.add_row(
+            str(index),
+            detection.engine,
+            f"[{color}]{detection.severity}[/{color}]",
+            detection.threat_name,
+            detection.malware_type,
+            detection.path,
+            detection.evidence,
+        )
+    console.print(table)
+
+
+def explain_results(detections: list[Detection], engines: list[str], files_scanned: int) -> str:
+    """Explain scan results in plain language."""
+
+    engine_text = ", ".join(engines)
+    if not detections:
+        return (
+            f"Scanned {files_scanned} file(s) with {engine_text}. No detections were found. "
+            "This is good, but it does not prove the machine is completely clean. Keep signatures updated, "
+            "scan suspicious downloads, and use a trusted real-time antivirus."
+        )
+
+    counts = Counter(detection.malware_type for detection in detections)
+    type_text = ", ".join(f"{name} ({count})" for name, count in counts.most_common())
+    return (
+        f"Found {len(detections)} detection(s) while scanning with {engine_text}. "
+        f"Detected categories: {type_text}. Quarantine is usually the safest first action because it "
+        "isolates the file while preserving it for review. Delete only when you are confident the file is unwanted."
+    )
+
+
+def quarantine_file(path: Path, quarantine_dir: Path, detection: Detection) -> tuple[str, str]:
+    """Move a detected file into quarantine and write metadata."""
+
+    if not path.exists():
+        return "missing", "File was not found; it may already have been removed."
+
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    digest = detection.sha256 or sha256_file(path)
+    safe_name = path.name.replace(os.sep, "_")
+    destination = quarantine_dir / f"{timestamp}_{digest[:12]}_{safe_name}"
+    shutil.move(str(path), str(destination))
+    metadata = {
+        "original_path": str(path.resolve()),
+        "quarantine_path": str(destination.resolve()),
+        "detection": asdict(detection),
+        "quarantined_at": datetime.now(timezone.utc).isoformat(),
+    }
+    destination.with_suffix(destination.suffix + ".metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+    return "quarantined", str(destination.resolve())
+
+
+def delete_file(path: Path) -> tuple[str, str]:
+    """Delete a detected file."""
+
+    if not path.exists():
+        return "missing", "File was not found; it may already have been removed."
+    path.unlink()
+    return "deleted", "File deleted."
+
+
+def apply_actions(
+    detections: list[Detection],
+    action: str,
+    quarantine_dir: Path,
+) -> list[Detection]:
+    """Ask for or apply actions against detected files."""
+
+    if not detections:
+        return detections
+
+    unique_paths: dict[str, list[Detection]] = {}
+    for detection in detections:
+        unique_paths.setdefault(detection.path, []).append(detection)
+
+    for path_text, related in unique_paths.items():
+        file_path = Path(path_text)
+        selected = action
+        if selected == "ask":
+            console.print(f"\n[bold]Detection:[/bold] {path_text}")
+            for detection in related:
+                console.print(f"- {detection.engine}: {detection.threat_name} ({detection.severity})")
+            selected = prompt_action()
+
+        if selected == "ignore":
+            result, detail = "ignored", "User chose to ignore this detection."
+        elif selected == "quarantine":
+            result, detail = quarantine_file(file_path, quarantine_dir, related[0])
+        elif selected == "delete":
+            result, detail = delete_file(file_path)
+        else:
+            result, detail = "ignored", "Unknown action; defaulted to ignore."
+
+        for detection in related:
+            detection.action = result
+            detection.action_detail = detail
+    return detections
+
+
+def prompt_action() -> str:
+    """Prompt user for a detection action."""
+
+    while True:
+        choice = input("Choose action: [q]uarantine, [d]elete, [i]gnore: ").strip().lower()
+        if choice in {"q", "quarantine"}:
+            return "quarantine"
+        if choice in {"d", "delete"}:
+            confirm = input("Type DELETE to permanently delete this file: ").strip()
+            return "delete" if confirm == "DELETE" else "ignore"
+        if choice in {"i", "ignore", ""}:
+            return "ignore"
+        console.print("[yellow]Please choose q, d, or i.[/yellow]")
+
+
+def write_json_report(path: Path, report: ScanReport) -> None:
+    """Write JSON report."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(report), indent=2), encoding="utf-8")
+
+
+def write_csv_report(path: Path, detections: list[Detection]) -> None:
+    """Write detection summary as CSV."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(asdict(detections[0]).keys()) if detections else ["path"])
+        writer.writeheader()
+        for detection in detections:
+            writer.writerow(asdict(detection))
+
+
+def run_status(args: argparse.Namespace) -> int:
+    """Show engine status."""
+
+    del args
+    render_engine_status([clamav_status(), defender_status(), EngineStatus("local", True, "built-in", "EICAR test and optional SHA-256 signature DB.")])
+    return 0
+
+
+def run_update(args: argparse.Namespace) -> int:
+    """Update local engine signatures where supported."""
+
+    engines = resolve_engines(args.engine)
+    for engine in engines:
+        if engine == "clamav":
+            freshclam = shutil.which("freshclam")
+            if not freshclam:
+                console.print("[yellow]freshclam was not found. Install ClamAV to update ClamAV signatures.[/yellow]")
+                continue
+            code, output = run_command([freshclam], timeout=args.timeout)
+            console.print(Panel(output.strip() or f"freshclam exited with code {code}", title="ClamAV Update"))
+        elif engine == "defender":
+            if platform.system().lower() != "windows":
+                console.print("[yellow]Windows Defender updates are only available on Windows.[/yellow]")
+                continue
+            code, output = run_command(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Update-MpSignature"],
+                timeout=args.timeout,
+            )
+            console.print(Panel(output.strip() or f"Update-MpSignature exited with code {code}", title="Defender Update"))
+        elif engine == "local":
+            console.print("[blue]Local signatures do not need updates unless you provide a new --signature-db file.[/blue]")
+    return 0
+
+
+def run_scan(args: argparse.Namespace) -> int:
+    """Run antivirus scan."""
+
+    target = args.target.resolve()
+    engines = resolve_engines(args.engine)
+    console.print(
+        Panel(
+            f"Target: [bold]{target}[/bold]\n"
+            f"Engines: [bold]{', '.join(engines)}[/bold]\n"
+            f"Action after scan: [bold]{args.action}[/bold]\n"
+            f"Quarantine directory: [bold]{args.quarantine_dir.resolve()}[/bold]",
+            title="Simple Antivirus Scan",
+            border_style="cyan",
+        )
+    )
+
+    all_detections: list[Detection] = []
+    notes: list[str] = []
+    files_scanned = 0
+    for engine in engines:
+        if engine == "local":
+            detections, count, engine_notes = scan_with_local_signatures(
+                target,
+                args.signature_db,
+                max_size_mb=args.max_size_mb,
+            )
+            files_scanned = max(files_scanned, count)
+        elif engine == "clamav":
+            detections, count, engine_notes = scan_with_clamav(target, timeout=args.timeout)
+            files_scanned = max(files_scanned, count)
+        elif engine == "defender":
+            detections, count, engine_notes = scan_with_defender(target, timeout=args.timeout)
+            files_scanned = max(files_scanned, count)
+        else:
+            detections, count, engine_notes = [], 0, [f"Unknown engine: {engine}"]
+        all_detections.extend(detections)
+        notes.extend(engine_notes)
+
+    detections = dedupe_detections(all_detections)
+    render_detections(detections)
+    explanation = explain_results(detections, engines, files_scanned)
+    console.print(Panel(explanation, title="Result Explanation", border_style="blue"))
+
+    if notes:
+        note_panel = "\n".join(notes[:12])
+        console.print(Panel(note_panel, title="Scan Notes", border_style="yellow"))
+
+    detections = apply_actions(detections, args.action, args.quarantine_dir.resolve())
+
+    report = ScanReport(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        target=str(target),
+        engines=engines,
+        files_scanned=files_scanned,
+        detections=detections,
+        explanation=explanation,
+    )
+    if args.json_out:
+        write_json_report(args.json_out.resolve(), report)
+        console.print(f"[green]JSON report saved to {args.json_out.resolve()}[/green]")
+    if args.csv_out:
+        write_csv_report(args.csv_out.resolve(), detections)
+        console.print(f"[green]CSV report saved to {args.csv_out.resolve()}[/green]")
+    return 0
+
+
+def run_create_demo_lab(args: argparse.Namespace) -> int:
+    """Create harmless demo files and a matching custom signature database."""
+
+    directory = args.directory.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    clean_file = directory / "clean_note.txt"
+    suspicious_file = directory / "demo_trojan_sample.txt"
+    signature_db = directory / "demo_signatures.json"
+
+    clean_file.write_text("This is a clean demo file.\n", encoding="utf-8")
+    suspicious_file.write_text(
+        "This is not malware. It is a harmless demo file used to test custom antivirus signatures.\n",
+        encoding="utf-8",
+    )
+    digest = sha256_file(suspicious_file)
+    signature_db.write_text(
+        json.dumps(
+            {
+                "signatures": [
+                    {
+                        "sha256": digest,
+                        "name": "Demo.Trojan.TestSignature",
+                        "type": "trojan",
+                        "severity": "HIGH",
+                    }
+                ]
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    console.print(
+        Panel(
+            f"Demo lab created at {directory}\n"
+            f"Signature DB: {signature_db}\n\n"
+            "Test it with:\n"
+            f"python .\\simple_antivirus_scanner.py scan {directory} --engine local --signature-db {signature_db} --action ask",
+            title="Demo Lab Ready",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI parser."""
+
+    parser = argparse.ArgumentParser(description="Simple antivirus-style scanner for defensive use.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    status = subparsers.add_parser("status", help="Show available antivirus engines.")
+    status.set_defaults(func=run_status)
+
+    update = subparsers.add_parser("update", help="Update ClamAV or Windows Defender signatures.")
+    update.add_argument("--engine", default="auto", help="auto, clamav, defender, local, all, or comma-separated.")
+    update.add_argument("--timeout", type=int, default=900, help="Update timeout in seconds.")
+    update.set_defaults(func=run_update)
+
+    scan = subparsers.add_parser("scan", help="Scan a file or folder.")
+    scan.add_argument("target", type=Path, help="File or folder to scan.")
+    scan.add_argument("--engine", default="auto", help="auto, local, clamav, defender, all, or comma-separated.")
+    scan.add_argument("--signature-db", type=Path, help="Optional custom SHA-256 signature JSON file.")
+    scan.add_argument("--max-size-mb", type=int, default=DEFAULT_MAX_SIZE_MB, help="Max file size for local scanning.")
+    scan.add_argument("--timeout", type=int, default=1800, help="External engine timeout in seconds.")
+    scan.add_argument(
+        "--action",
+        choices=["ask", "quarantine", "delete", "ignore"],
+        default="ask",
+        help="What to do with detections after the scan. Default: ask.",
+    )
+    scan.add_argument("--quarantine-dir", type=Path, default=DEFAULT_QUARANTINE_DIR, help="Quarantine folder.")
+    scan.add_argument("--json-out", type=Path, help="Save JSON report.")
+    scan.add_argument("--csv-out", type=Path, help="Save CSV report.")
+    scan.set_defaults(func=run_scan)
+
+    demo = subparsers.add_parser("create-demo-lab", help="Create harmless test files and a custom signature DB.")
+    demo.add_argument("--directory", type=Path, default=Path("demo_lab"), help="Demo lab output directory.")
+    demo.set_defaults(func=run_create_demo_lab)
+
+    return parser
+
+
+def main() -> int:
+    """CLI entry point."""
+
+    parser = build_parser()
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Scan interrupted by user.[/yellow]")
+        raise SystemExit(130)
