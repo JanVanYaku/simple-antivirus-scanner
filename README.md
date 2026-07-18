@@ -48,6 +48,15 @@ $env:KASPERSKY_AVP_PATH="C:\Program Files\Kaspersky Lab\Your Product\avp.com"
 $env:KASPERSKY_KESCLI_PATH="C:\Program Files\Kaspersky Lab\Your Product\kescli.exe"
 ```
 
+Check whether the Avast command-line tools actually exist:
+
+```powershell
+Test-Path "C:\Program Files\AVAST Software\Avast\ashCmd.exe"
+Test-Path "C:\Program Files\AVAST Software\Avast\ashUpd.exe"
+```
+
+`AVAST_ASHCMD_PATH` is used for scans. `AVAST_ASHUPD_PATH` is used for updates. If `ashCmd.exe` is found, the app also checks the same folder for `ashUpd.exe` automatically.
+
 ## Update Signatures
 
 Update the available engine:

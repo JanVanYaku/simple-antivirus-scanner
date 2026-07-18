@@ -136,6 +136,28 @@ def env_or_find(env_name: str, candidates: list[str | Path]) -> str:
     return find_existing_executable(candidates)
 
 
+def sibling_executable(path_text: str, executable: str) -> str:
+    """Find an executable next to another discovered executable."""
+
+    if not path_text:
+        return ""
+    candidate = Path(path_text).with_name(executable)
+    return str(candidate) if candidate.is_file() else ""
+
+
+def env_override_note(env_names: list[str]) -> str:
+    """Describe configured environment overrides and whether they exist."""
+
+    notes: list[str] = []
+    for name in env_names:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            continue
+        state = "exists" if Path(value).is_file() else "not found"
+        notes.append(f"{name}={value} ({state})")
+    return "; ".join(notes)
+
+
 def program_files_candidates(*parts: str, executable: str) -> list[Path]:
     """Build Program Files candidate paths for Windows tools."""
 
@@ -329,22 +351,25 @@ def defender_status() -> EngineStatus:
 def avast_paths() -> tuple[str, str]:
     """Return Avast scanner and updater paths when installed."""
 
-    scanner = env_or_find(
-        "AVAST_ASHCMD_PATH",
-        [
-            "ashCmd.exe",
-            *program_files_candidates("AVAST Software", "Avast", executable="ashCmd.exe"),
-            *program_files_candidates("Avast Software", "Avast", executable="ashCmd.exe"),
-        ],
-    )
-    updater = env_or_find(
-        "AVAST_ASHUPD_PATH",
-        [
-            "ashUpd.exe",
-            *program_files_candidates("AVAST Software", "Avast", executable="ashUpd.exe"),
-            *program_files_candidates("Avast Software", "Avast", executable="ashUpd.exe"),
-        ],
-    )
+    scanner_candidates = [
+        "ashCmd.exe",
+        *program_files_candidates("AVAST Software", "Avast", executable="ashCmd.exe"),
+        *program_files_candidates("Avast Software", "Avast", executable="ashCmd.exe"),
+    ]
+    scanner = env_or_find("AVAST_ASHCMD_PATH", scanner_candidates)
+
+    updater_candidates: list[str | Path] = [
+        "ashUpd.exe",
+        *program_files_candidates("AVAST Software", "Avast", executable="ashUpd.exe"),
+        *program_files_candidates("Avast Software", "Avast", executable="ashUpd.exe"),
+    ]
+    sibling_updater = sibling_executable(scanner, "ashUpd.exe")
+    if sibling_updater:
+        updater_candidates.insert(0, sibling_updater)
+    updater = env_or_find("AVAST_ASHUPD_PATH", updater_candidates)
+
+    if updater and not scanner:
+        scanner = sibling_executable(updater, "ashCmd.exe")
     return scanner, updater
 
 
@@ -353,14 +378,18 @@ def avast_status() -> EngineStatus:
 
     scanner, updater = avast_paths()
     if not scanner:
+        override_note = env_override_note(["AVAST_ASHCMD_PATH", "AVAST_ASHUPD_PATH"])
+        detail = (
+            "Avast ashCmd.exe was not found. Install Avast Business/Small Office "
+            "or set AVAST_ASHCMD_PATH to ashCmd.exe."
+        )
+        if override_note:
+            detail += f" Overrides: {override_note}."
         return EngineStatus(
             engine="avast",
             available=False,
             version="not installed",
-            detail=(
-                "Avast ashCmd.exe was not found. Install Avast Business/Small Office "
-                "or set AVAST_ASHCMD_PATH to ashCmd.exe."
-            ),
+            detail=detail,
         )
     detail = f"scanner={scanner}"
     if updater:
@@ -970,9 +999,16 @@ def run_update(args: argparse.Namespace) -> int:
             )
             console.print(Panel(output.strip() or f"Update-MpSignature exited with code {code}", title="Defender Update"))
         elif engine == "avast":
-            _, updater = avast_paths()
+            scanner, updater = avast_paths()
             if not updater:
-                console.print("[yellow]Avast ashUpd.exe was not found. Install Avast or set AVAST_ASHUPD_PATH.[/yellow]")
+                message = "Avast ashUpd.exe was not found. Install Avast or set AVAST_ASHUPD_PATH."
+                if scanner:
+                    expected = Path(scanner).with_name("ashUpd.exe")
+                    message += f" Found ashCmd.exe at {scanner}; expected updater at {expected}."
+                override_note = env_override_note(["AVAST_ASHCMD_PATH", "AVAST_ASHUPD_PATH"])
+                if override_note:
+                    message += f" Overrides: {override_note}."
+                console.print(f"[yellow]{message}[/yellow]")
                 continue
             code, output = run_command([updater, "vps"], timeout=args.timeout)
             console.print(Panel(output.strip() or f"ashUpd.exe exited with code {code}", title="Avast VPS Update"))
