@@ -41,6 +41,14 @@ EICAR_BYTES = (
 DEFAULT_QUARANTINE_DIR = Path.home() / ".simple_antivirus_quarantine"
 DEFAULT_MAX_SIZE_MB = 256
 SUPPORTED_ENGINES = {"local", "clamav", "defender", "avast", "kaspersky"}
+PE_MACHINE_NAMES = {
+    0x014C: "x86",
+    0x8664: "x64",
+    0x01C0: "ARM",
+    0x01C2: "Thumb",
+    0x01C4: "ARMv7",
+    0xAA64: "ARM64",
+}
 
 
 @dataclass
@@ -90,8 +98,66 @@ class ScanReport:
     explanation: str
 
 
+def pe_machine_name(path: Path) -> str:
+    """Read a Windows PE executable machine type without launching it."""
+
+    try:
+        with path.open("rb") as handle:
+            if handle.read(2) != b"MZ":
+                return ""
+            handle.seek(0x3C)
+            pe_offset = int.from_bytes(handle.read(4), byteorder="little", signed=False)
+            if pe_offset <= 0:
+                return ""
+            handle.seek(pe_offset)
+            if handle.read(4) != b"PE\x00\x00":
+                return ""
+            machine = int.from_bytes(handle.read(2), byteorder="little", signed=False)
+    except OSError:
+        return ""
+    return PE_MACHINE_NAMES.get(machine, f"unknown PE machine 0x{machine:04x}")
+
+
+def executable_compatibility_error(path_text: str) -> str:
+    """Explain known Windows executable architecture mismatches before running them."""
+
+    if platform.system().lower() != "windows" or not path_text:
+        return ""
+
+    path = Path(shutil.which(path_text) or path_text)
+    if not path.is_file():
+        return ""
+
+    executable_arch = pe_machine_name(path)
+    if not executable_arch:
+        return ""
+
+    current_arch = platform.machine().lower()
+    compatible_arches = {
+        "amd64": {"x64", "x86"},
+        "x86_64": {"x64", "x86"},
+        "i386": {"x86"},
+        "i686": {"x86"},
+        "x86": {"x86"},
+        "arm64": {"ARM64", "x86", "x64"},
+        "aarch64": {"ARM64", "x86", "x64"},
+    }.get(current_arch)
+
+    if compatible_arches and executable_arch not in compatible_arches:
+        return (
+            f"{path} is a {executable_arch} executable, but this computer reports {platform.machine()}. "
+            "Windows cannot run that machine type here. Install the vendor build that matches your "
+            "Windows architecture, or point the matching environment variable to a compatible executable."
+        )
+    return ""
+
+
 def run_command(command: list[str], timeout: int = 300) -> tuple[int, str]:
     """Run a command and return exit code plus combined output."""
+
+    compatibility_error = executable_compatibility_error(command[0]) if command else ""
+    if compatibility_error:
+        return 1, compatibility_error
 
     try:
         completed = subprocess.run(
@@ -363,6 +429,13 @@ def clamav_status() -> EngineStatus:
             version="not installed",
             detail=detail,
         )
+    compatibility_error = executable_compatibility_error(clamscan)
+    if compatibility_error:
+        detail = f"scanner={clamscan}"
+        if freshclam:
+            detail += f"; updater={freshclam}"
+        detail += f"; error={compatibility_error}"
+        return EngineStatus("clamav", False, "incompatible executable", detail)
     code, output = run_command([clamscan, "--version"], timeout=30)
     friendly_output = friendly_engine_output(output)
     version = output.strip().splitlines()[0] if output.strip() else "available"
@@ -540,6 +613,9 @@ def scan_with_clamav(target: Path, timeout: int) -> tuple[list[Detection], int, 
     clamscan, _ = clamav_paths()
     if not clamscan:
         return [], 0, ["ClamAV clamscan was not found."]
+    compatibility_error = executable_compatibility_error(clamscan)
+    if compatibility_error:
+        return [], 0, [compatibility_error]
 
     command = [clamscan, "--recursive=yes", "--infected", "--no-summary", str(target)]
     code, output = run_command(command, timeout=timeout)
@@ -1064,9 +1140,16 @@ def run_update(args: argparse.Namespace) -> int:
                     message += f" Overrides: {override_note}."
                 console.print(f"[yellow]{message}[/yellow]")
                 continue
+            compatibility_error = executable_compatibility_error(freshclam)
+            if compatibility_error:
+                console.print(Panel(compatibility_error, title="ClamAV Update"))
+                continue
             code, output = run_command([freshclam], timeout=args.timeout)
+            message = friendly_engine_output(output) or "freshclam produced no output"
+            if code not in {0, 1}:
+                message = f"{message}\n\nfreshclam exited with code {code}"
             console.print(
-                Panel(friendly_engine_output(output) or f"freshclam exited with code {code}", title="ClamAV Update")
+                Panel(message, title="ClamAV Update")
             )
         elif engine == "defender":
             if platform.system().lower() != "windows":
@@ -1095,8 +1178,10 @@ def run_update(args: argparse.Namespace) -> int:
                 console.print(f"[yellow]{message}[/yellow]")
                 continue
             code, output = run_command([updater, "vps"], timeout=args.timeout)
+            message = friendly_engine_output(output) or "ashUpd.exe produced no output"
+            message = f"{message}\n\nashUpd.exe exited with code {code}"
             console.print(
-                Panel(friendly_engine_output(output) or f"ashUpd.exe exited with code {code}", title="Avast VPS Update")
+                Panel(message, title="Avast VPS Update")
             )
         elif engine == "kaspersky":
             avp, kescli = kaspersky_paths()

@@ -67,7 +67,9 @@ C:\Program Files\Avast Software\Suite
 
 That folder may include `ashUpd.exe` for updates but not `ashCmd.exe` for command-line scans. In that case Avast updates can work, but Avast scanning through this wrapper is unavailable unless your Avast edition provides `ashCmd.exe`.
 
-If ClamAV is found but Windows reports `WinError 216`, the installed ClamAV executable does not match your Windows architecture. Install the matching ClamAV build for your machine, or set `CLAMAV_CLAMSCAN_PATH` and `CLAMAV_FRESHCLAM_PATH` to compatible executables.
+If ClamAV is found but Windows reports `WinError 216` or a "Machine Type Mismatch" popup, the installed ClamAV executable does not match your Windows architecture. For example, an `ARM64` ClamAV build will not run on an `AMD64` Windows PC. Install the matching ClamAV build for your machine, or set `CLAMAV_CLAMSCAN_PATH` and `CLAMAV_FRESHCLAM_PATH` to compatible executables.
+
+The app checks the Windows executable type before launching ClamAV, so incompatible ClamAV installs are reported in the status table instead of repeatedly opening the Windows mismatch popup.
 
 ## Update Signatures
 
